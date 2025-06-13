@@ -78,11 +78,11 @@ class CHOIR:
 
         return round(res, 2), new_labels
 
-    def run_clustering_hierarchy(self, alpha=0.9):
-        res, labels = self.optimal_cluster(alpha=alpha)
+    def run_clustering_hierarchy(self, main_alpha=0.9, sub_alpha=0.7, n_levels=3, min_cells=100):
+        res, labels = self.optimal_cluster(alpha=main_alpha)
         self.adata.obs["choir_level_0"] = labels
 
-        for level in range(3):
+        for level in range(n_levels):
             col = f"choir_level_{level + 1}"
             self.adata.obs[col] = self.adata.obs[f"choir_level_{level}"]
 
@@ -90,12 +90,12 @@ class CHOIR:
                 if parent_label[-1] != "X":
                     indexer = self.adata.obs[f"choir_level_{level}"] == parent_label
 
-                    if indexer.sum() < 100:
+                    if indexer.sum() < min_cells:
                         continue
 
                     res, labels = self.optimal_cluster(
                         resolution_range=(0.1, 2.0, 0.1),
-                        alpha=0.7,
+                        alpha=sub_alpha,
                         model_type="linear_model",
                         test_size=0.5
                     )
