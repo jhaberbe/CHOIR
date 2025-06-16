@@ -10,8 +10,6 @@ from sklearn.linear_model import LogisticRegression, SGDClassifier
 
 from collections import defaultdict
 
-
-
 class CHOIR:
 
     def __init__(self, adata):
@@ -98,7 +96,8 @@ class CHOIR:
         self.adata.obs["choir_level_0"] = labels
 
         # Setup the initial clusters.
-        for i in trange(1, 5):
+        for i in trange(1, 6):
+            self.adata.obs[f"choir_level_{i}"] = None
             print(f"Running choir_level_{i}...")
             for cluster in self.adata.obs[f"choir_level_{i-1}"].unique():
                 if cluster is None:
