@@ -1,110 +1,143 @@
 import numpy as np
-import pandas as pd
-import sklearn.ensemble
-import sklearn.linear_model
-import sklearn.neural_network
 import scanpy as sc
-from IPython.display import clear_output
+import pandas as pd
+from tqdm import tqdm
+from sklearn.metrics import silhouette_score
+import scipy.stats
+from tqdm import trange
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score
+from sklearn.linear_model import LogisticRegression, SGDClassifier
+
+from collections import defaultdict
+
+
 
 class CHOIR:
-    def __init__(self, adata, batch_key="orig.ident"):
+
+    def __init__(self, adata):
+        """
+        Initialize the CHOIR model with an AnnData object.
+        
+        Parameters:
+        adata (AnnData): The annotated data matrix.
+        """
         self.adata = adata
-        self.batch_key = batch_key
 
-    def model_selection(self, model_type="ensemble"):
-        if isinstance(model_type, str):
-            print(f"Model type: {model_type}")
-            if model_type == "ensemble":
-                return sklearn.ensemble.RandomForestClassifier(class_weight="balanced")
-            if model_type == "linear_model":
-                return sklearn.linear_model.LogisticRegression(class_weight="balanced")
-            if model_type == "neural_network":
-                return sklearn.neural_network.MLPClassifier(class_weight="balanced")
-        elif all(hasattr(model_type, attr) for attr in ["fit", "score", "predict"]):
-            return model_type
-        else:
-            raise ValueError(f"Model type '{model_type}' is not recognized or does not have the required methods.")
+    @staticmethod
+    def optimal_clustering(adata):
+        # We'll be using a copy of the original AnnData object.
+        # Return the best resolution and labels.
+        adata_copy = adata.copy()
 
-    def optimal_cluster(self, resolution_range=(0.05, 2.0, 0.05), alpha=0.95, model_type="linear_model", test_size=0.5):
-        new_labels = None
-        adata_copy = self.adata.copy()
+        sc.pp.pca(adata_copy, n_comps=10, svd_solver="arpack")
+        sc.external.pp.harmony_integrate(adata_copy, key="orig.ident")
+        sc.pp.neighbors(adata_copy, n_neighbors=10, n_pcs=10, use_rep="X_pca_harmony")
 
-        if "highly_variable" in adata_copy.var.columns:
-            adata_copy = adata_copy[:, adata_copy.var["highly_variable"]]
+        best_res = 0
+        best_score = -1
+        best_labels = pd.Series(["X"] * adata_copy.n_obs)
 
-        model = sklearn.linear_model.LogisticRegression(class_weight="balanced")
-        model.fit(adata_copy.X, adata_copy.obs[self.batch_key])
-        adata_copy = adata_copy[:, model.coef_.max(axis=0) < pd.Series(model.coef_.max(axis=0)).quantile(.90)]
+        # Resolution range.
+        for res in np.linspace(0.05, 2.0, 40):
 
-        sc.tl.pca(adata_copy, svd_solver="arpack")
-
-        if self.batch_key in adata_copy.obs.columns and adata_copy.obs[self.batch_key].nunique() > 1:
-            sc.external.pp.harmony_integrate(adata_copy, key=self.batch_key)
-        else:
-            print(f"Skipping Harmony: insufficient metadata in '{self.batch_key}'")
-
-        sc.pp.neighbors(adata_copy, n_neighbors=20, n_pcs=20, use_rep="X_pca_harmony")
-
-        model = self.model_selection(model_type)
-
-        X = adata_copy.X
-        for res in np.arange(resolution_range[0], resolution_range[1] + resolution_range[2], resolution_range[2]):
-            res = round(res, 2)
-            sc.tl.leiden(adata_copy, resolution=res, flavor='igraph', n_iterations=2)
-
-            if adata_copy.obs['leiden'].nunique() == 1:
+            # Leiden Clustering.
+            sc.tl.leiden(adata_copy, resolution=0.1, flavor="igraph", n_iterations=2)
+            if adata_copy.obs["leiden"].nunique() < 2:
                 continue
+            new_score = silhouette_score(adata_copy.X, adata_copy.obs["leiden"], metric='euclidean', sample_size=1000)
 
-            y = adata_copy.obs['leiden']
-            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=42, stratify=y)
+            # New Score.
+            if new_score > best_score:
+                best_score = new_score
+                best_res = res
+                best_labels = adata_copy.obs["leiden"].copy()
+            else:
+                print(f"Resolution {res:.2f} did not improve silhouette score: {new_score:.4f}")
+                return res, best_labels
+        
+        return best_res, best_labels
+
+    @staticmethod
+    def get_prefix_table(adata, column):
+        prefix_table = defaultdict(list)
+        for x in adata.obs[column].dropna().unique():
+            prefix = ".".join(x.split(".")[:-1])
+            prefix_table[prefix].append(x)
+        return prefix_table
+
+    @staticmethod
+    def permutation_testing(X, y, n_permutations=20, shuffle=True):
+        model = SGDClassifier(class_weight="balanced", max_iter=1000, random_state=42)
+        permutation_accuracies = []
+        for i in range(n_permutations):
+
+            if shuffle:
+                # Shuffle the labels
+                y_permuted = np.random.permutation(y)
+            
+            else:
+                # Use the original labels
+                y_permuted = y
+
+            X_train, X_test, y_train, y_test = train_test_split(
+                X,
+                y_permuted,
+                stratify=y_permuted,
+                test_size=0.8,
+            )
 
             model.fit(X_train, y_train)
-            y_pred = model.predict(X_test)
+            perm_accuracy = model.score(X_test, y_test)
+            permutation_accuracies.append(perm_accuracy)
 
-            per_class_accuracies = [
-                accuracy_score(y_test[y_test == label], y_pred[y_test == label])
-                for label in y_test.cat.categories if (y_test == label).sum() > 0
-            ]
+        return np.array(permutation_accuracies)
 
-            min_acc = min(per_class_accuracies)
-            if min_acc >= alpha:
-                new_labels = y
-            else:
-                clear_output(wait=True)
-                print(f"Resolution {res} failed: min class accuracy = {round(min_acc, 3)}")
-                return round(res - resolution_range[2], 2), new_labels
+    def run(self, sample_id = "orig.ident"):
 
-        return round(res, 2), new_labels
-
-    def run_clustering_hierarchy(self, main_alpha=0.9, sub_alpha=0.7, n_levels=3, min_cells=100):
-        res, labels = self.optimal_cluster(alpha=main_alpha)
+        _, labels = self.optimal_clustering(self.adata)
         self.adata.obs["choir_level_0"] = labels
 
-        for level in range(n_levels):
-            col = f"choir_level_{level + 1}"
-            self.adata.obs[col] = self.adata.obs[f"choir_level_{level}"]
+        # Setup the initial clusters.
+        for i in trange(1, 5):
+            print(f"Running choir_level_{i}...")
+            for cluster in self.adata.obs[f"choir_level_{i-1}"].unique():
+                if cluster is None:
+                    continue
 
-            for parent_label in self.adata.obs[f"choir_level_{level}"].cat.categories:
-                if parent_label[-1] != "X":
-                    indexer = self.adata.obs[f"choir_level_{level}"] == parent_label
+                adata_subset = self.adata[self.adata.obs[f"choir_level_{i-1}"] == cluster].copy()
 
-                    if indexer.sum() < min_cells:
-                        continue
+                if adata_subset.n_obs < 100:
+                    continue
 
-                    res, labels = self.optimal_cluster(
-                        resolution_range=(0.1, 2.0, 0.1),
-                        alpha=sub_alpha,
-                        model_type="linear_model",
-                        test_size=0.5
-                    )
+                sc.pp.pca(adata_subset, n_comps=10, svd_solver="arpack")
+                if sample_id != None:
+                    sc.external.pp.harmony_integrate(adata_subset, key="orig.ident")
+                    sc.pp.neighbors(adata_subset, n_neighbors=10, n_pcs=10, use_rep="X_pca_harmony")
+                else:
+                    sc.pp.neighbors(adata_subset, n_neighbors=10, n_pcs=10, use_rep="X_pca")
 
-                    if labels is None:
-                        new_labels = [f"{parent_label}.X"] * indexer.sum()
-                    else:
-                        new_labels = [f"{parent_label}.{lbl}" for lbl in labels]
+                best_res, labels = self.optimal_clustering(adata_subset)
 
-                    new_cats = pd.unique(new_labels)
-                    self.adata.obs[col] = self.adata.obs[col].cat.add_categories(new_cats)
-                    self.adata.obs.loc[indexer, col] = new_labels
+                self.adata[self.adata.obs[f"choir_level_{i-1}"] == cluster].obs[f"choir_level_{i}"] = labels
+
+        for i in list(range(1, 5))[::-1]:
+            print(f"Attempting to merge choir_level_{i+1}...")
+            prefix_table = self.get_prefix_table(adata=self.adata, column=f"choir_level_{i+1}")
+
+            for parent, children in tqdm(prefix_table.items()):
+                if len(children) < 2:
+                    continue
+
+                X = self.adata[self.adata.obs[f"choir_level_{i+1}"].isin(children)].X
+                y = self.adata[self.adata.obs[f"choir_level_{i+1}"].isin(children)].obs[f"choir_level_{i+1}"]
+
+                if len(y.unique()) < 2:
+                    continue
+
+                true_accuracy = pd.Series(self.permutation_testing(X, y, shuffle=False))
+                bootstrapped_null = pd.Series(self.permutation_testing(X, y))
+
+                statistical_test = scipy.stats.ttest_ind(true_accuracy, bootstrapped_null, equal_var=False, nan_policy="omit")
+
+                if statistical_test.pvalue > 0.05:
+                    self.adata[self.adata.obs[f"choir_level_{i+1}"].isin(children)].obs[f"choir_level_{i+1}"] = None
